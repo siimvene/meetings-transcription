@@ -84,7 +84,7 @@ meetings-transcription/          # GPU server services (this repo)
     ├── api/                     # FastAPI backend
     └── web/                     # Next.js frontend
 
-meetings-transcription-bot/      # Windows server (separate repo)
+[meetings-transcription-bot](https://github.com/siimvene/meetings-transcription-bot)  # Windows server (separate repo)
 ├── src/                         # C# .NET 8 bot
 │   ├── BotService.cs            # Call handling, chat interaction
 │   ├── AudioHandler.cs          # Per-participant audio capture
