@@ -1,0 +1,10 @@
+.git
+.gitignore
+data/
+*.wav
+*.mp3
+*.mp4
+*.webm
+.DS_Store
+README.md
+deploy/
