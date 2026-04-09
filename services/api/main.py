@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 
 app = FastAPI(title="Meetings Transcription API")
 
+PCM_WAV_SUFFIX = ".pcm.wav"
 TRANSCRIPTION_URL = os.environ.get("TRANSCRIPTION_URL", "ws://transcription:8000/asr")
 SUMMARIZER_URL = os.environ.get("SUMMARIZER_URL", "http://summarizer:8001")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data/transcripts"))
@@ -48,7 +49,7 @@ async def transcribe_file(
 
     try:
         # Convert to PCM 16kHz mono WAV using ffmpeg
-        pcm_path = tmp_path + ".pcm.wav"
+        pcm_path = tmp_path + PCM_WAV_SUFFIX
         subprocess.run(
             [
                 "ffmpeg", "-y", "-i", tmp_path,
@@ -66,8 +67,8 @@ async def transcribe_file(
         segments = await _transcribe_audio(pcm_data)
     finally:
         os.unlink(tmp_path)
-        if os.path.exists(tmp_path + ".pcm.wav"):
-            os.unlink(tmp_path + ".pcm.wav")
+        if os.path.exists(tmp_path + PCM_WAV_SUFFIX):
+            os.unlink(tmp_path + PCM_WAV_SUFFIX)
 
     # Build diarized transcript text
     transcript_text = _segments_to_text(segments)
@@ -172,46 +173,54 @@ async def _transcribe_audio(pcm_data: bytes) -> list[dict]:
 
     try:
         async with websockets.connect(TRANSCRIPTION_URL) as ws:
-            # Send audio in chunks
-            for i in range(0, len(pcm_data), chunk_size):
-                chunk = pcm_data[i : i + chunk_size]
-                await ws.send(chunk)
-                await asyncio.sleep(0.05)  # pace to avoid overwhelming
-
-            # Signal end
-            await ws.send(bytes())
-
-            # Collect responses
-            async for message in ws:
-                try:
-                    data = json.loads(message)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-
-                if data.get("type") == "config":
-                    continue
-
-                if data.get("type") == "ready_to_stop":
-                    # Grab final lines
-                    for line in data.get("lines", []):
-                        segments.append(_parse_segment(line))
-                    break
-
-                for line in data.get("lines", []):
-                    parsed = _parse_segment(line)
-                    # Update or add segment
-                    existing = next(
-                        (s for s in segments if s["start"] == parsed["start"]), None
-                    )
-                    if existing:
-                        existing.update(parsed)
-                    else:
-                        segments.append(parsed)
-
+            await _send_audio_chunks(ws, pcm_data, chunk_size)
+            await _collect_segments(ws, segments)
     except Exception as e:
         segments.append({"error": str(e), "start": "0:00:00", "end": "0:00:00"})
 
     return segments
+
+
+async def _send_audio_chunks(ws, pcm_data: bytes, chunk_size: int):
+    """Send audio data in chunks and signal end of stream."""
+    for i in range(0, len(pcm_data), chunk_size):
+        chunk = pcm_data[i : i + chunk_size]
+        await ws.send(chunk)
+        await asyncio.sleep(0.05)
+    await ws.send(bytes())
+
+
+async def _collect_segments(ws, segments: list[dict]):
+    """Collect transcription segments from WebSocket responses."""
+    async for message in ws:
+        data = _parse_ws_message(message)
+        if data is None or data.get("type") == "config":
+            continue
+
+        if data.get("type") == "ready_to_stop":
+            for line in data.get("lines", []):
+                segments.append(_parse_segment(line))
+            break
+
+        for line in data.get("lines", []):
+            _upsert_segment(segments, _parse_segment(line))
+
+
+def _parse_ws_message(message) -> dict | None:
+    """Parse a WebSocket message as JSON, returning None on failure."""
+    try:
+        return json.loads(message)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _upsert_segment(segments: list[dict], parsed: dict):
+    """Update an existing segment or append a new one."""
+    existing = next((s for s in segments if s["start"] == parsed["start"]), None)
+    if existing:
+        existing.update(parsed)
+    else:
+        segments.append(parsed)
 
 
 def _parse_segment(line: dict) -> dict:

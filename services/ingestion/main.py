@@ -76,36 +76,8 @@ class AudioSession:
                     segments = json.loads(message)
                     if not isinstance(segments, list):
                         segments = [segments]
-
                     for segment in segments:
-                        if not segment.get("text", "").strip():
-                            continue
-
-                        payload = {
-                            "meeting_id": self.meeting_id,
-                            "participant_id": self.participant_id,
-                            "start_ms": int(segment.get("start", 0) * 1000),
-                            "end_ms": int(segment.get("end", 0) * 1000),
-                            "text": segment["text"].strip(),
-                            "language": segment.get("language", "unknown"),
-                            "confidence": segment.get("confidence", 0.0),
-                        }
-
-                        try:
-                            async with httpx.AsyncClient(timeout=10) as client:
-                                resp = await client.post(
-                                    f"{ASSEMBLY_URL}/segments",
-                                    json=payload,
-                                )
-                                if resp.status_code != 200:
-                                    logger.error(
-                                        "Failed to forward segment to assembly: %s %s",
-                                        resp.status_code,
-                                        resp.text[:200],
-                                    )
-                        except httpx.HTTPError:
-                            logger.exception("Error forwarding segment to assembly service")
-
+                        await self._forward_segment(segment)
                 except json.JSONDecodeError:
                     logger.warning("Non-JSON message from WhisperLiveKit: %s", message[:100])
         except websockets.exceptions.ConnectionClosed:
@@ -119,6 +91,33 @@ class AudioSession:
                 "Error in transcription receiver for participant %s",
                 self.participant_id,
             )
+
+    async def _forward_segment(self, segment: dict):
+        """Forward a single transcription segment to the assembly service."""
+        if not segment.get("text", "").strip():
+            return
+
+        payload = {
+            "meeting_id": self.meeting_id,
+            "participant_id": self.participant_id,
+            "start_ms": int(segment.get("start", 0) * 1000),
+            "end_ms": int(segment.get("end", 0) * 1000),
+            "text": segment["text"].strip(),
+            "language": segment.get("language", "unknown"),
+            "confidence": segment.get("confidence", 0.0),
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.post(f"{ASSEMBLY_URL}/segments", json=payload)
+                if resp.status_code != 200:
+                    logger.error(
+                        "Failed to forward segment to assembly: %s %s",
+                        resp.status_code,
+                        resp.text[:200],
+                    )
+        except httpx.HTTPError:
+            logger.exception("Error forwarding segment to assembly service")
 
     async def send_audio(self, pcm_data: bytes):
         """Forward PCM audio data to WhisperLiveKit."""
@@ -245,6 +244,57 @@ async def _update_participant_roster(meeting: MeetingState, chunk: audio_ingesti
             logger.exception("Error registering participant %s", pid)
 
 
+async def _get_or_create_meeting(chunk) -> MeetingState:
+    """Get or create meeting state under lock."""
+    async with _meetings_lock:
+        if chunk.meeting_id not in meetings:
+            meetings[chunk.meeting_id] = MeetingState(
+                meeting_id=chunk.meeting_id,
+                owner_aad_id=chunk.owner_aad_id,
+                meeting_title=chunk.meeting_title,
+            )
+        return meetings[chunk.meeting_id]
+
+
+def _log_room_device(chunk):
+    """Log room device detection for Sortformer diarization."""
+    if chunk.is_room_device:
+        logger.info(
+            "Room device detected: participant %s (%s) in meeting %s — "
+            "Sortformer diarization needed for shared microphone",
+            chunk.participant_id, chunk.display_name, chunk.meeting_id,
+        )
+
+
+async def _get_or_create_session(meeting, meeting_id, participant_id, display_name, chunks_received):
+    """Get existing or create new audio session. Returns (session, error_result)."""
+    if participant_id in meeting.sessions:
+        return meeting.sessions[participant_id], None
+
+    session = AudioSession(meeting_id, participant_id, display_name)
+    try:
+        await session.connect()
+    except Exception:
+        logger.exception("Cannot establish WebSocket for participant %s, aborting stream", participant_id)
+        return None, audio_ingestion_pb2.StreamResult(
+            ok=False,
+            message=f"WebSocket connection failed for participant {participant_id}",
+            chunks_received=chunks_received,
+        )
+    meeting.sessions[participant_id] = session
+    return session, None
+
+
+async def _cleanup_session(session, meeting_id, participant_id):
+    """Close session and remove from meeting state."""
+    if not session:
+        return
+    await session.close()
+    async with _meetings_lock:
+        if meeting_id in meetings and participant_id in meetings[meeting_id].sessions:
+            del meetings[meeting_id].sessions[participant_id]
+
+
 class AudioIngestionServicer(audio_ingestion_pb2_grpc.AudioIngestionServicer):
     """gRPC service implementation for AudioIngestion."""
 
@@ -260,70 +310,27 @@ class AudioIngestionServicer(audio_ingestion_pb2_grpc.AudioIngestionServicer):
                 meeting_id = chunk.meeting_id
                 participant_id = chunk.participant_id
 
-                async with _meetings_lock:
-                    # Get or create meeting state
-                    if meeting_id not in meetings:
-                        meetings[meeting_id] = MeetingState(
-                            meeting_id=meeting_id,
-                            owner_aad_id=chunk.owner_aad_id,
-                            meeting_title=chunk.meeting_title,
-                        )
-                    meeting = meetings[meeting_id]
-
-                # Create meeting record on first chunk
+                meeting = await _get_or_create_meeting(chunk)
                 await _ensure_meeting_created(meeting, chunk)
-
-                # Update participant roster
                 await _update_participant_roster(meeting, chunk)
+                _log_room_device(chunk)
 
-                # Log room device for Sortformer diarization
-                if chunk.is_room_device:
-                    logger.info(
-                        "Room device detected: participant %s (%s) in meeting %s — "
-                        "Sortformer diarization needed for shared microphone",
-                        participant_id,
-                        chunk.display_name,
-                        meeting_id,
-                    )
+                session, error_result = await _get_or_create_session(
+                    meeting, meeting_id, participant_id, chunk.display_name, chunks_received,
+                )
+                if error_result:
+                    return error_result
 
-                # Get or create audio session
-                if participant_id not in meeting.sessions:
-                    session = AudioSession(meeting_id, participant_id, chunk.display_name)
-                    try:
-                        await session.connect()
-                    except Exception:
-                        logger.exception(
-                            "Cannot establish WebSocket for participant %s, aborting stream",
-                            participant_id,
-                        )
-                        return audio_ingestion_pb2.StreamResult(
-                            ok=False,
-                            message=f"WebSocket connection failed for participant {participant_id}",
-                            chunks_received=chunks_received,
-                        )
-                    meeting.sessions[participant_id] = session
-                else:
-                    session = meeting.sessions[participant_id]
-
-                # Forward PCM audio to WhisperLiveKit
                 if chunk.pcm_data:
                     await session.send_audio(chunk.pcm_data)
                     chunks_received += 1
 
-            # Stream ended normally — close the participant's session
-            if session:
-                await session.close()
-                async with _meetings_lock:
-                    if meeting_id in meetings and participant_id in meetings[meeting_id].sessions:
-                        del meetings[meeting_id].sessions[participant_id]
+            await _cleanup_session(session, meeting_id, participant_id)
 
             logger.info(
                 "StreamAudio completed for participant %s in meeting %s — %d chunks",
-                participant_id,
-                meeting_id,
-                chunks_received,
+                participant_id, meeting_id, chunks_received,
             )
-
             return audio_ingestion_pb2.StreamResult(
                 ok=True,
                 message=f"Stream completed for participant {participant_id}",
@@ -333,16 +340,9 @@ class AudioIngestionServicer(audio_ingestion_pb2_grpc.AudioIngestionServicer):
         except Exception:
             logger.exception(
                 "Error in StreamAudio for participant %s in meeting %s",
-                participant_id,
-                meeting_id,
+                participant_id, meeting_id,
             )
-            # Clean up session on error
-            if session:
-                await session.close()
-                async with _meetings_lock:
-                    if meeting_id in meetings and participant_id in meetings[meeting_id].sessions:
-                        del meetings[meeting_id].sessions[participant_id]
-
+            await _cleanup_session(session, meeting_id, participant_id)
             return audio_ingestion_pb2.StreamResult(
                 ok=False,
                 message=f"Stream error for participant {participant_id}",

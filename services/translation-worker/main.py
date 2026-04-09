@@ -30,9 +30,6 @@ def parse_args():
     file_args.add_argument('--output-lang', type=str,
                            help="Output language code.")
 
-    # TODO: add domain and input_type?
-    # TODO: add stdin / stdout?
-
     return parser.parse_args()
 
 

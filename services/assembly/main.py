@@ -18,6 +18,8 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+DB_NOT_AVAILABLE = "Database not available"
+
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgresql://meetings:changeme@postgres:5432/meetings"
 )
@@ -175,6 +177,40 @@ async def trigger_summarization(
 # --- Application lifecycle ---
 
 
+async def _connect_postgres() -> asyncpg.Pool:
+    """Connect to PostgreSQL with retry."""
+    for attempt in range(1, 11):
+        try:
+            pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+            logger.info("Connected to PostgreSQL")
+            return pool
+        except Exception:
+            logger.warning("PostgreSQL connection attempt %d/10 failed, retrying in 3s...", attempt)
+            if attempt == 10:
+                logger.exception("Failed to connect to PostgreSQL after 10 attempts")
+                raise
+            await asyncio.sleep(3)
+
+
+async def _connect_rabbitmq() -> tuple[aio_pika.abc.AbstractRobustConnection | None, aio_pika.abc.AbstractChannel | None]:
+    """Connect to RabbitMQ with retry."""
+    for attempt in range(1, 11):
+        try:
+            connection = await aio_pika.connect_robust(
+                host=MQ_HOST, port=MQ_PORT, login=MQ_USERNAME, password=MQ_PASSWORD,
+            )
+            channel = await connection.channel()
+            logger.info("Connected to RabbitMQ")
+            return connection, channel
+        except Exception:
+            logger.warning("RabbitMQ connection attempt %d/10 failed, retrying in 3s...", attempt)
+            if attempt == 10:
+                logger.warning("Failed to connect to RabbitMQ — translation will be unavailable")
+            else:
+                await asyncio.sleep(3)
+    return None, None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage startup and shutdown of database and message queue connections."""
@@ -185,41 +221,11 @@ async def lifespan(app: FastAPI):
     logger.info("RabbitMQ: %s:%s", MQ_HOST, MQ_PORT)
     logger.info("Summarizer: %s", SUMMARIZER_URL)
 
-    # Connect to PostgreSQL with retry
-    for attempt in range(1, 11):
-        try:
-            db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
-            logger.info("Connected to PostgreSQL")
-            break
-        except Exception:
-            logger.warning("PostgreSQL connection attempt %d/10 failed, retrying in 3s...", attempt)
-            if attempt == 10:
-                logger.exception("Failed to connect to PostgreSQL after 10 attempts")
-                raise
-            await asyncio.sleep(3)
-
-    # Connect to RabbitMQ with retry
-    for attempt in range(1, 11):
-        try:
-            mq_connection = await aio_pika.connect_robust(
-                host=MQ_HOST,
-                port=MQ_PORT,
-                login=MQ_USERNAME,
-                password=MQ_PASSWORD,
-            )
-            mq_channel = await mq_connection.channel()
-            logger.info("Connected to RabbitMQ")
-            break
-        except Exception:
-            logger.warning("RabbitMQ connection attempt %d/10 failed, retrying in 3s...", attempt)
-            if attempt == 10:
-                logger.warning("Failed to connect to RabbitMQ — translation will be unavailable")
-            else:
-                await asyncio.sleep(3)
+    db_pool = await _connect_postgres()
+    mq_connection, mq_channel = await _connect_rabbitmq()
 
     yield
 
-    # Shutdown
     logger.info("Shutting down...")
     if mq_channel:
         await mq_channel.close()
@@ -246,7 +252,7 @@ async def health():
 async def create_meeting(req: MeetingCreateRequest):
     """Create a meeting record. Called by ingestion on first audio chunk."""
     if not db_pool:
-        raise HTTPException(status_code=503, detail="Database not available")
+        raise HTTPException(status_code=503, detail=DB_NOT_AVAILABLE)
 
     try:
         await db_pool.execute(
@@ -268,7 +274,7 @@ async def create_meeting(req: MeetingCreateRequest):
 async def register_participant(req: ParticipantRequest):
     """Register or update a participant in a meeting."""
     if not db_pool:
-        raise HTTPException(status_code=503, detail="Database not available")
+        raise HTTPException(status_code=503, detail=DB_NOT_AVAILABLE)
 
     try:
         await db_pool.execute(
@@ -296,7 +302,7 @@ async def register_participant(req: ParticipantRequest):
 async def receive_segment(req: SegmentRequest):
     """Store a transcript segment. Called by ingestion when WhisperLiveKit produces output."""
     if not db_pool:
-        raise HTTPException(status_code=503, detail="Database not available")
+        raise HTTPException(status_code=503, detail=DB_NOT_AVAILABLE)
 
     try:
         segment = {
@@ -333,7 +339,7 @@ async def receive_segment(req: SegmentRequest):
 async def end_meeting(req: EndMeetingRequest):
     """Signal meeting end. Triggers summarization pipeline."""
     if not db_pool:
-        raise HTTPException(status_code=503, detail="Database not available")
+        raise HTTPException(status_code=503, detail=DB_NOT_AVAILABLE)
 
     logger.info("End-meeting signal received for %s", req.meeting_id)
 
@@ -371,7 +377,7 @@ async def summarize_now(req: SummarizeNowRequest):
     """On-demand summary for the bot to post mid-meeting or at meeting end.
     Returns the summary text synchronously (blocks until Gemma responds)."""
     if not db_pool:
-        raise HTTPException(status_code=503, detail="Database not available")
+        raise HTTPException(status_code=503, detail=DB_NOT_AVAILABLE)
 
     rows = await db_pool.fetch(
         """SELECT ts.start_ms, ts.original_text, ts.source_language,
