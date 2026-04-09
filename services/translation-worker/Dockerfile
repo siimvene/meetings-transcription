@@ -13,7 +13,7 @@ RUN adduser --disabled-password --gecos "app" app && chown -R app:app /app
 USER app
 ENV PATH="/home/app/.local/bin:${PATH}"
 
-RUN pip install --user --upgrade pip setuptools wheel cython
+RUN pip install --user "pip<24.1" setuptools wheel cython
 
 COPY services/translation-worker/requirements.txt .
 RUN pip install --user -r requirements.txt --no-cache-dir && \
