@@ -8,7 +8,7 @@ services:
       context: .
       dockerfile: services/transcription/Dockerfile
     ports:
-      - "8000:8000"
+      - "8100:8000"  # Remapped: vLLM already on host port 8000
     volumes:
       - hf-cache:/root/.cache/huggingface/hub
     environment:
@@ -41,6 +41,8 @@ services:
       dockerfile: services/ingestion/Dockerfile
     ports:
       - "50051:50051"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     env_file:
       - config/.env
     depends_on:
@@ -109,6 +111,8 @@ services:
       dockerfile: services/summarizer/Dockerfile
     ports:
       - "8001:8001"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     env_file:
       - config/.env
     healthcheck:
@@ -148,6 +152,8 @@ services:
       dockerfile: services/api/Dockerfile
     ports:
       - "8080:8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     env_file:
       - config/.env
     depends_on:
