@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM python:3.12-slim
 
 RUN apt-get update && \
     apt-get install --yes --no-install-recommends gcc g++ libffi-dev git && \
@@ -13,12 +13,10 @@ RUN adduser --disabled-password --gecos "app" app && chown -R app:app /app
 USER app
 ENV PATH="/home/app/.local/bin:${PATH}"
 
-RUN pip install --user "pip<24.1" && \
-    pip install --user setuptools wheel cython "numpy<1.24.0"
+RUN pip install --user --upgrade pip setuptools wheel cython
 
-# Copy from hk-kone-transkriptsioon translation-worker
 COPY services/translation-worker/requirements.txt .
-RUN pip install --user --no-build-isolation -r requirements.txt --no-cache-dir && \
+RUN pip install --user -r requirements.txt --no-cache-dir && \
     rm requirements.txt && \
     python -c "import nltk; nltk.download('punkt_tab', quiet=True)"
 
