@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.10-slim
 
 RUN apt-get update && \
     apt-get install --yes --no-install-recommends gcc g++ libffi-dev git && \
@@ -13,7 +13,8 @@ RUN adduser --disabled-password --gecos "app" app && chown -R app:app /app
 USER app
 ENV PATH="/home/app/.local/bin:${PATH}"
 
-RUN pip install --user "pip<24.1" setuptools wheel cython
+RUN pip install --user "pip<24.1" && \
+    pip install --user setuptools wheel cython "numpy<1.24.0"
 
 COPY services/translation-worker/requirements.txt .
 RUN pip install --user -r requirements.txt --no-cache-dir && \
