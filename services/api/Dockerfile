@@ -6,7 +6,7 @@ RUN apt-get update && \
     apt-get install --yes --no-install-recommends curl ffmpeg && \
     rm -rf /var/cache/apt/archives /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir fastapi uvicorn httpx websockets python-multipart aiofiles
+RUN pip install --no-cache-dir fastapi uvicorn httpx websockets python-multipart aiofiles asyncpg PyJWT[crypto]
 
 COPY services/api/main.py ./
 

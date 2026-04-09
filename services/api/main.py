@@ -2,20 +2,28 @@
 
 import asyncio
 import json
+import logging
 import os
 import subprocess
 import tempfile
-import uuid
+import uuid as uuid_mod
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 import aiofiles
+import asyncpg
 import httpx
 import websockets
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-app = FastAPI(title="Meetings Transcription API")
+import jwt
+from jwt import PyJWKClient
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
 PCM_WAV_SUFFIX = ".pcm.wav"
 TRANSCRIPTION_URL = os.environ.get("TRANSCRIPTION_URL", "ws://transcription:8000/asr")
@@ -23,10 +31,89 @@ SUMMARIZER_URL = os.environ.get("SUMMARIZER_URL", "http://summarizer:8001")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data/transcripts"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL", "postgresql://meetings:changeme@postgres:5432/meetings"
+)
+AZURE_TENANT_ID = os.environ.get("AZURE_TENANT_ID", "")
+AZURE_CLIENT_ID = os.environ.get("AZURE_CLIENT_ID", "")
+
+OPENID_CONFIG_URL = f"https://login.microsoftonline.com/{AZURE_TENANT_ID}/v2.0/.well-known/openid-configuration"
+JWKS_URL = f"https://login.microsoftonline.com/{AZURE_TENANT_ID}/discovery/v2.0/keys"
+ISSUER = f"https://login.microsoftonline.com/{AZURE_TENANT_ID}/v2.0"
+
+# Global state
+db_pool: asyncpg.Pool | None = None
+jwk_client: PyJWKClient | None = None
+security = HTTPBearer()
+
+
+# --- Auth ---
+
+
+async def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> dict:
+    """Validate Azure AD JWT and return user claims."""
+    token = credentials.credentials
+
+    if not AZURE_TENANT_ID or not AZURE_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="Azure AD not configured")
+
+    try:
+        signing_key = jwk_client.get_signing_key_from_jwt(token)
+        claims = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=AZURE_CLIENT_ID,
+            issuer=ISSUER,
+        )
+        return claims
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError as e:
+        logger.warning("JWT validation failed: %s", e)
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def get_user_oid(claims: dict) -> str:
+    """Extract user object ID from JWT claims."""
+    return claims.get("oid") or claims.get("sub", "")
+
+
+# --- Lifecycle ---
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global db_pool, jwk_client
+
+    # Connect to PostgreSQL
+    try:
+        db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+        logger.info("Connected to PostgreSQL")
+    except Exception:
+        logger.exception("Failed to connect to PostgreSQL")
+        raise
+
+    # Initialize JWKS client for token validation
+    if AZURE_TENANT_ID:
+        jwk_client = PyJWKClient(JWKS_URL, cache_keys=True)
+        logger.info("JWKS client initialized for tenant %s", AZURE_TENANT_ID)
+
+    yield
+
+    if db_pool:
+        await db_pool.close()
+        logger.info("PostgreSQL connection closed")
+
+
+app = FastAPI(title="Meetings Transcription API", lifespan=lifespan)
+
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "timestamp": datetime.now(timezone.utc).isoformat()}
+    return {"status": "ok", "database": db_pool is not None, "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
 @app.post("/transcribe")
@@ -37,7 +124,7 @@ async def transcribe_file(
     title: str = Form(""),
 ):
     """Upload an audio file for transcription and optional summarization."""
-    transcript_id = str(uuid.uuid4())[:8]
+    transcript_id = str(uuid_mod.uuid4())[:8]
     timestamp = datetime.now(timezone.utc).isoformat()
 
     # Save uploaded file temporarily
@@ -106,29 +193,111 @@ async def transcribe_file(
 
 
 @app.get("/transcripts")
-async def list_transcripts():
-    """List all stored transcripts."""
-    transcripts = []
-    for path in sorted(DATA_DIR.glob("*.json"), reverse=True):
-        async with aiofiles.open(path) as f:
-            data = json.loads(await f.read())
-            transcripts.append({
-                "id": data["id"],
-                "title": data["title"],
-                "timestamp": data["timestamp"],
-                "has_summary": bool(data.get("summary")),
-            })
+async def list_transcripts(claims: dict = Depends(get_current_user)):
+    """List meetings owned by the authenticated user."""
+    user_oid = get_user_oid(claims)
+    if not user_oid:
+        raise HTTPException(status_code=401, detail="User identity not found in token")
+
+    rows = await db_pool.fetch(
+        """SELECT m.id, m.title, m.started_at, m.ended_at, m.status, m.owner_aad_id,
+                  (SELECT count(*) FROM participants p WHERE p.meeting_id = m.id) AS participant_count,
+                  (SELECT count(*) > 0 FROM summaries s WHERE s.meeting_id = m.id) AS has_summary
+           FROM meetings m
+           WHERE m.owner_aad_id = $1
+           ORDER BY m.started_at DESC""",
+        user_oid,
+    )
+
+    transcripts = [
+        {
+            "id": str(row["id"]),
+            "title": row["title"] or "Untitled Meeting",
+            "timestamp": row["started_at"].isoformat() if row["started_at"] else "",
+            "ended_at": row["ended_at"].isoformat() if row["ended_at"] else None,
+            "status": row["status"],
+            "owner_aad_id": row["owner_aad_id"],
+            "participant_count": row["participant_count"],
+            "has_summary": row["has_summary"],
+        }
+        for row in rows
+    ]
+
     return {"transcripts": transcripts}
 
 
 @app.get("/transcripts/{transcript_id}")
-async def get_transcript(transcript_id: str):
-    """Retrieve a specific transcript."""
-    path = DATA_DIR / f"{transcript_id}.json"
-    if not path.exists():
+async def get_transcript(transcript_id: str, claims: dict = Depends(get_current_user)):
+    """Retrieve a specific transcript. Only the owner can access it."""
+    user_oid = get_user_oid(claims)
+    if not user_oid:
+        raise HTTPException(status_code=401, detail="User identity not found in token")
+
+    # Validate UUID format
+    try:
+        meeting_uuid = uuid_mod.UUID(transcript_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid transcript ID format")
+
+    # Verify ownership
+    meeting = await db_pool.fetchrow(
+        "SELECT id, title, started_at, ended_at, status, owner_aad_id FROM meetings WHERE id = $1",
+        meeting_uuid,
+    )
+    if not meeting:
         raise HTTPException(status_code=404, detail="Transcript not found")
-    async with aiofiles.open(path) as f:
-        return json.loads(await f.read())
+    if meeting["owner_aad_id"] != user_oid:
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    # Fetch segments with speaker names
+    segments = await db_pool.fetch(
+        """SELECT ts.start_ms, ts.end_ms, ts.original_text, ts.translated_text,
+                  ts.source_language, ts.confidence, p.display_name
+           FROM transcript_segments ts
+           LEFT JOIN participants p ON ts.participant_id = p.id
+           WHERE ts.meeting_id = $1
+           ORDER BY ts.start_ms""",
+        meeting_uuid,
+    )
+
+    # Fetch summary
+    summary_row = await db_pool.fetchrow(
+        "SELECT summary_text FROM summaries WHERE meeting_id = $1 ORDER BY generated_at DESC LIMIT 1",
+        meeting_uuid,
+    )
+
+    # Build transcript text
+    formatted_segments = [
+        {
+            "start": _ms_to_timestamp(row["start_ms"]),
+            "end": _ms_to_timestamp(row["end_ms"]),
+            "text": row["original_text"],
+            "translated_text": row["translated_text"],
+            "speaker": row["display_name"],
+            "language": row["source_language"] or "",
+        }
+        for row in segments
+    ]
+
+    return {
+        "id": str(meeting["id"]),
+        "title": meeting["title"] or "Untitled Meeting",
+        "timestamp": meeting["started_at"].isoformat() if meeting["started_at"] else "",
+        "language": "",
+        "segments": formatted_segments,
+        "transcript": _segments_to_text(formatted_segments),
+        "summary": summary_row["summary_text"] if summary_row else "",
+        "owner_aad_id": meeting["owner_aad_id"],
+    }
+
+
+def _ms_to_timestamp(ms: int) -> str:
+    """Convert milliseconds to H:MM:SS format."""
+    total_seconds = ms // 1000
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    seconds = total_seconds % 60
+    return f"{hours}:{minutes:02d}:{seconds:02d}"
 
 
 @app.websocket("/ws/transcribe")

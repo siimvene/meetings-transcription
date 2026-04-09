@@ -24,11 +24,7 @@ function MeetingList() {
           ...loginRequest,
           account: account!,
         });
-        const all = await listTranscripts(tokenResponse.accessToken);
-        // Filter to meetings owned by current user
-        const owned = all.filter(
-          (m) => !m.owner_aad_id || m.owner_aad_id === account!.localAccountId
-        );
+        const owned = await listTranscripts(tokenResponse.accessToken);
         setMeetings(owned);
       } catch (err) {
         setError(err instanceof Error ? err.message : "Failed to load meetings");
