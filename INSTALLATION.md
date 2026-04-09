@@ -45,16 +45,19 @@ In the Azure Portal of your Microsoft 365 tenant:
 In the bot's app registration:
 
 1. Go to **API permissions** > **Add a permission** > **Microsoft Graph** > **Application permissions**
-2. Add these three permissions:
+2. Add these two permissions:
    - `Calls.JoinGroupCall.All` — join meetings
    - `Calls.AccessMedia.All` — capture audio
-   - `Chat.ReadWrite.All` — read/write meeting chat messages
 3. Click **Grant admin consent for [your org]**
    - This requires Global Administrator or Privileged Role Administrator
    - If you can't do this yourself, send the admin this consent URL:
      ```
      https://login.microsoftonline.com/{TENANT_ID}/adminconsent?client_id={BOT_APP_ID}
      ```
+
+> **Note:** Chat permissions use RSC (Resource-Specific Consent) declared in the Teams app manifest,
+> not tenant-wide Graph permissions. `ChatMessage.Read.Chat` is granted per-meeting when the bot is
+> installed. Summaries are posted via Bot Framework proactive messaging — no `Chat.ReadWrite.All` needed.
 
 ### 1.3 Create the Azure Bot Resource
 
@@ -239,6 +242,15 @@ Invoke-WebRequest -Uri 'https://dot.net/v1/dotnet-install.ps1' -OutFile 'dotnet-
 
 ### 3.4 Get TLS Certificate
 
+The bot needs **one certificate** that serves two purposes:
+
+| Purpose | Used by | Requirement |
+|---|---|---|
+| **HTTPS** for webhook endpoints (`/api/calls`, `/api/messages`) | ASP.NET Core (Kestrel) | Must be trusted by Microsoft's servers (publicly signed) |
+| **MTLS** for media platform (SRTP audio encryption) | Graph Communications SDK (`CertificateThumbprint`) | Must be trusted by Microsoft Teams media relays (publicly signed) |
+
+**A single Let's Encrypt certificate covers both.** Self-signed certs won't work — Microsoft's servers and media relays reject untrusted certificates.
+
 Using [win-acme](https://www.win-acme.com/) (free Let's Encrypt certificates):
 
 ```powershell
@@ -248,19 +260,29 @@ New-Item -ItemType Directory -Force -Path C:\wacs, C:\certs
 Invoke-WebRequest -Uri $wacsUrl -OutFile C:\wacs\wacs.zip -UseBasicParsing
 Expand-Archive -Path C:\wacs\wacs.zip -DestinationPath C:\wacs -Force
 
-# Request certificate
+# Request certificate — exports both PEM (for Kestrel) and to Windows cert store (for media platform)
 C:\wacs\wacs.exe `
   --source manual `
   --host your-bot-hostname.region.cloudapp.azure.com `
-  --store pemfiles `
+  --store pemfiles,certificatestore `
   --pemfilespath C:\certs `
+  --certificatestore My `
   --accepttos `
   --emailaddress admin@yourorg.com `
   --validation selfhosting `
   --closeonfinish
 ```
 
-The certificate auto-renews via a scheduled task.
+After this runs:
+- PEM files land in `C:\certs\` → used by `CertificatePath` in appsettings.json
+- Certificate is also in Windows cert store (`Cert:\LocalMachine\My`) → used by `CertificateThumbprint` for the media platform
+
+Get the thumbprint:
+```powershell
+Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.Subject -like "*your-bot-hostname*" } | Select Thumbprint
+```
+
+The certificate auto-renews via a scheduled task created by win-acme.
 
 ### 3.5 Deploy the Bot
 
