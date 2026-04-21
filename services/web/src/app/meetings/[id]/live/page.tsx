@@ -21,7 +21,7 @@ function LiveView() {
           View full transcript &rarr;
         </Link>
       </div>
-      <LiveTranscript />
+      <LiveTranscript meetingId={id} />
     </div>
   );
 }

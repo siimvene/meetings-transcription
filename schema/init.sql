@@ -52,3 +52,4 @@ CREATE INDEX idx_meetings_status ON meetings(status);
 CREATE INDEX idx_segments_meeting ON transcript_segments(meeting_id);
 CREATE INDEX idx_segments_time ON transcript_segments(meeting_id, start_ms);
 CREATE INDEX idx_participants_meeting ON participants(meeting_id);
+CREATE UNIQUE INDEX uq_participant_meeting_aad ON participants(meeting_id, aad_user_id);

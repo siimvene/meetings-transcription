@@ -1,66 +1,81 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
-import { getWebSocketUrl } from "@/lib/api";
+import { useMsal, useAccount } from "@azure/msal-react";
+import { getLiveWebSocketUrl } from "@/lib/api";
+import { loginRequest } from "@/lib/msal";
 
 interface LiveSegment {
   text: string;
+  translated_text?: string;
   speaker?: string;
   start?: string;
-  is_final?: boolean;
 }
 
-export default function LiveTranscript() {
+interface LiveTranscriptProps {
+  meetingId: string;
+}
+
+export default function LiveTranscript({ meetingId }: LiveTranscriptProps) {
   const [segments, setSegments] = useState<LiveSegment[]>([]);
-  const [status, setStatus] = useState<"connecting" | "connected" | "disconnected">("connecting");
+  const [status, setStatus] = useState<
+    "connecting" | "connected" | "disconnected" | "ended"
+  >("connecting");
   const wsRef = useRef<WebSocket | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const { instance, accounts } = useMsal();
+  const account = useAccount(accounts[0] || {});
 
-  const connect = useCallback(() => {
-    const url = getWebSocketUrl();
+  const connect = useCallback(async () => {
+    if (!account) return;
+
     setStatus("connecting");
 
-    const ws = new WebSocket(url);
-    wsRef.current = ws;
+    try {
+      const tokenResponse = await instance.acquireTokenSilent({
+        ...loginRequest,
+        account,
+      });
 
-    ws.onopen = () => setStatus("connected");
+      const url = getLiveWebSocketUrl(meetingId, tokenResponse.accessToken);
+      const ws = new WebSocket(url);
+      wsRef.current = ws;
 
-    ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.type === "config") return;
+      ws.onopen = () => setStatus("connected");
 
-        const lines = data.lines || [];
-        for (const line of lines) {
-          const seg: LiveSegment = {
-            text: line.text?.trim() || "",
-            speaker: line.speaker || undefined,
-            start: line.start ? String(line.start) : undefined,
-            is_final: line.is_final ?? false,
-          };
-          if (!seg.text) continue;
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
 
-          setSegments((prev) => {
-            // Replace last non-final segment from same speaker, or append
-            if (
-              !seg.is_final &&
-              prev.length > 0 &&
-              !prev[prev.length - 1].is_final &&
-              prev[prev.length - 1].speaker === seg.speaker
-            ) {
-              return [...prev.slice(0, -1), seg];
+          if (data.type === "meeting_ended") {
+            setStatus("ended");
+            return;
+          }
+
+          if (data.type === "segment") {
+            const seg: LiveSegment = {
+              text: data.text || "",
+              translated_text: data.translated_text || undefined,
+              speaker: data.speaker || undefined,
+              start: data.start || undefined,
+            };
+            if (seg.text) {
+              setSegments((prev) => [...prev, seg]);
             }
-            return [...prev, seg];
-          });
+          }
+        } catch {
+          // ignore non-JSON messages
         }
-      } catch {
-        // ignore non-JSON messages
-      }
-    };
+      };
 
-    ws.onclose = () => setStatus("disconnected");
-    ws.onerror = () => setStatus("disconnected");
-  }, []);
+      ws.onclose = () => {
+        setStatus((prev) => (prev === "ended" ? "ended" : "disconnected"));
+      };
+      ws.onerror = () => setStatus("disconnected");
+    } catch {
+      setStatus("disconnected");
+    }
+  }, [account, instance, meetingId]);
 
   useEffect(() => {
     connect();
@@ -73,12 +88,13 @@ export default function LiveTranscript() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [segments]);
 
-  const statusColor =
-    status === "connected"
-      ? "bg-emerald-500"
-      : status === "connecting"
-      ? "bg-amber-500"
-      : "bg-red-500";
+  const statusColors: Record<string, string> = {
+    connected: "bg-emerald-500",
+    connecting: "bg-amber-500",
+    ended: "bg-blue-500",
+    disconnected: "bg-red-500",
+  };
+  const statusColor = statusColors[status];
 
   return (
     <div className="bg-surface-light border border-gray-700 rounded-lg p-6">
@@ -104,11 +120,16 @@ export default function LiveTranscript() {
             Waiting for speech...
           </p>
         )}
+        {status === "ended" && segments.length === 0 && (
+          <p className="text-gray-500 text-sm italic">
+            Meeting has ended. No transcript segments were recorded.
+          </p>
+        )}
         {segments.map((seg, i) => {
           const showSpeaker =
             i === 0 || segments[i - 1]?.speaker !== seg.speaker;
           return (
-            <div key={i}>
+            <div key={`${seg.start}-${seg.speaker}-${i}`}>
               {showSpeaker && seg.speaker && (
                 <div className="flex items-baseline gap-2 mt-3 first:mt-0">
                   <span className="font-medium text-sm text-accent">
@@ -119,16 +140,22 @@ export default function LiveTranscript() {
                   )}
                 </div>
               )}
-              <p
-                className={`text-sm leading-relaxed pl-2 ${
-                  seg.is_final ? "text-gray-300" : "text-gray-500 italic"
-                }`}
-              >
+              <p className="text-sm leading-relaxed pl-2 text-gray-300">
                 {seg.text}
               </p>
+              {seg.translated_text && (
+                <p className="text-sm leading-relaxed pl-2 text-gray-500 italic">
+                  {seg.translated_text}
+                </p>
+              )}
             </div>
           );
         })}
+        {status === "ended" && segments.length > 0 && (
+          <p className="text-gray-500 text-sm italic mt-4 pt-4 border-t border-gray-700">
+            Meeting ended
+          </p>
+        )}
         <div ref={bottomRef} />
       </div>
     </div>

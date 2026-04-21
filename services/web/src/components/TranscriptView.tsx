@@ -53,7 +53,7 @@ export default function TranscriptView({ segments }: { segments: Segment[] }) {
           const colorClass = getSpeakerColor(speaker, speakerMap);
 
           return (
-            <div key={i}>
+            <div key={`${seg.start}-${seg.speaker}-${i}`}>
               {showSpeaker && (
                 <div className="flex items-baseline gap-2 mt-4 first:mt-0">
                   <span className={`font-medium text-sm ${colorClass}`}>

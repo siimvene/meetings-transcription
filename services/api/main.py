@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import os
-import subprocess
 import tempfile
 import uuid as uuid_mod
 from contextlib import asynccontextmanager
@@ -15,8 +14,7 @@ import aiofiles
 import asyncpg
 import httpx
 import websockets
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile, WebSocket
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 import jwt
@@ -31,9 +29,7 @@ SUMMARIZER_URL = os.environ.get("SUMMARIZER_URL", "http://summarizer:8001")
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data/transcripts"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL", "postgresql://meetings:changeme@postgres:5432/meetings"
-)
+DATABASE_URL = os.environ["DATABASE_URL"]
 AZURE_TENANT_ID = os.environ.get("AZURE_TENANT_ID", "")
 AZURE_CLIENT_ID = os.environ.get("AZURE_CLIENT_ID", "")
 
@@ -123,28 +119,32 @@ async def transcribe_file(
     summarize: bool = Form(True),
     title: str = Form(""),
 ):
-    """Upload an audio file for transcription and optional summarization."""
+    """Upload an audio file for ad-hoc transcription (standalone feature).
+
+    This endpoint is independent of the live meeting pipeline. It saves results
+    to JSON files on disk, not to PostgreSQL. Intended for quick one-off transcriptions."""
     transcript_id = str(uuid_mod.uuid4())[:8]
     timestamp = datetime.now(timezone.utc).isoformat()
 
     # Save uploaded file temporarily
     suffix = Path(file.filename or "audio.wav").suffix
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        content = await file.read()
-        tmp.write(content)
-        tmp_path = tmp.name
-
+    tmp_path = os.path.join(tempfile.gettempdir(), f"{uuid_mod.uuid4()}{suffix}")
     try:
+        content = await file.read()
+        async with aiofiles.open(tmp_path, "wb") as af:
+            await af.write(content)
+
         # Convert to PCM 16kHz mono WAV using ffmpeg
         pcm_path = tmp_path + PCM_WAV_SUFFIX
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-i", tmp_path,
-                "-ar", "16000", "-ac", "1", "-f", "wav", pcm_path,
-            ],
-            capture_output=True,
-            check=True,
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", tmp_path,
+            "-ar", "16000", "-ac", "1", "-f", "wav", pcm_path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(f"ffmpeg failed: {stderr.decode()[:500]}")
 
         # Read converted audio
         async with aiofiles.open(pcm_path, "rb") as f:
@@ -333,6 +333,106 @@ async def ws_transcribe(websocket: WebSocket):
 
     except Exception as e:
         await websocket.close(code=1011, reason=str(e)[:120])
+
+
+def _validate_ws_token(token: str) -> dict | None:
+    """Validate a JWT token for WebSocket authentication. Returns claims or None."""
+    if not AZURE_TENANT_ID or not AZURE_CLIENT_ID or not jwk_client:
+        return None
+    try:
+        signing_key = jwk_client.get_signing_key_from_jwt(token)
+        return jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=AZURE_CLIENT_ID,
+            issuer=ISSUER,
+        )
+    except jwt.InvalidTokenError:
+        return None
+
+
+@app.websocket("/ws/meetings/{meeting_id}/live")
+async def ws_meeting_live(websocket: WebSocket, meeting_id: str):
+    """Stream live transcript segments for an in-progress meeting.
+
+    Authenticates via ?token= query parameter (WebSocket can't use Authorization header).
+    Polls the DB for new segments and streams them to the client.
+    """
+    # Authenticate via query param
+    token = websocket.query_params.get("token")
+    if not token:
+        await websocket.close(code=1008, reason="Missing token")
+        return
+
+    claims = _validate_ws_token(token)
+    if not claims:
+        await websocket.close(code=1008, reason="Invalid token")
+        return
+
+    user_oid = get_user_oid(claims)
+
+    # Validate meeting ID and ownership
+    try:
+        meeting_uuid = uuid_mod.UUID(meeting_id)
+    except ValueError:
+        await websocket.close(code=1008, reason="Invalid meeting ID")
+        return
+
+    meeting = await db_pool.fetchrow(
+        "SELECT owner_aad_id, status FROM meetings WHERE id = $1",
+        meeting_uuid,
+    )
+    if not meeting or meeting["owner_aad_id"] != user_oid:
+        await websocket.close(code=1008, reason="Meeting not found or access denied")
+        return
+
+    await websocket.accept()
+
+    last_created_at = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+    try:
+        while True:
+            rows = await db_pool.fetch(
+                """SELECT ts.start_ms, ts.end_ms, ts.original_text,
+                          ts.translated_text, ts.source_language, p.display_name,
+                          ts.created_at
+                   FROM transcript_segments ts
+                   LEFT JOIN participants p ON ts.participant_id = p.id
+                   WHERE ts.meeting_id = $1 AND ts.created_at > $2
+                   ORDER BY ts.created_at""",
+                meeting_uuid,
+                last_created_at,
+            )
+
+            for row in rows:
+                await websocket.send_json({
+                    "type": "segment",
+                    "start": _ms_to_timestamp(row["start_ms"]),
+                    "end": _ms_to_timestamp(row["end_ms"]),
+                    "text": row["original_text"],
+                    "translated_text": row["translated_text"],
+                    "speaker": row["display_name"],
+                    "language": row["source_language"] or "",
+                })
+                last_created_at = row["created_at"]
+
+            # Check if meeting has ended
+            ended_at = await db_pool.fetchval(
+                "SELECT ended_at FROM meetings WHERE id = $1", meeting_uuid
+            )
+            if ended_at is not None:
+                await websocket.send_json({"type": "meeting_ended"})
+                break
+
+            await asyncio.sleep(1.5)
+    except Exception:
+        pass  # Client disconnected
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 async def _transcribe_audio(pcm_data: bytes) -> list[dict]:

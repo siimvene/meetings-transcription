@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import uuid
 from contextlib import asynccontextmanager
 
 import aio_pika
@@ -20,9 +21,7 @@ logger = logging.getLogger(__name__)
 
 DB_NOT_AVAILABLE = "Database not available"
 
-DATABASE_URL = os.environ.get(
-    "DATABASE_URL", "postgresql://meetings:changeme@postgres:5432/meetings"
-)
+DATABASE_URL = os.environ["DATABASE_URL"]
 MQ_HOST = os.environ.get("MQ_HOST", "rabbitmq")
 MQ_PORT = int(os.environ.get("MQ_PORT", "5672"))
 MQ_USERNAME = os.environ.get("MQ_USERNAME", "user")
@@ -36,10 +35,19 @@ HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
 TRANSLATE_LANGUAGES = {"en", "eng", "ru", "rus", "de", "ger", "fi", "fin"}
 LANG_2_TO_3 = {"en": "eng", "ru": "rus", "de": "ger", "fi": "fin"}
 
+# SQL queries
+SQL_MEETING_BY_CALL_ID = "SELECT id FROM meetings WHERE teams_call_id = $1"
+
 # Global state
 db_pool: asyncpg.Pool | None = None
 mq_connection: aio_pika.abc.AbstractRobustConnection | None = None
 mq_channel: aio_pika.abc.AbstractChannel | None = None
+translation_callback_queue: str | None = None
+_background_tasks: set[asyncio.Task] = set()
+
+# Caches: external Teams IDs -> internal UUIDs
+_meeting_id_cache: dict[str, uuid.UUID] = {}
+_participant_id_cache: dict[tuple[str, str], uuid.UUID] = {}
 
 
 # --- Pydantic models for HTTP endpoints ---
@@ -80,15 +88,76 @@ class EndMeetingRequest(BaseModel):
     chat_messages: list[ChatMessageItem] = []
 
 
+# --- ID resolution helpers ---
+
+
+async def _resolve_meeting_id(teams_call_id: str) -> uuid.UUID:
+    """Resolve a Teams call ID string to the internal meeting UUID."""
+    if teams_call_id in _meeting_id_cache:
+        return _meeting_id_cache[teams_call_id]
+
+    # If it's already a valid UUID, try direct lookup by PK
+    try:
+        as_uuid = uuid.UUID(teams_call_id)
+        exists = await db_pool.fetchval(
+            "SELECT id FROM meetings WHERE id = $1", as_uuid
+        )
+        if exists:
+            _meeting_id_cache[teams_call_id] = as_uuid
+            return as_uuid
+    except ValueError:
+        pass
+
+    # Look up by teams_call_id
+    internal_id = await db_pool.fetchval(
+        SQL_MEETING_BY_CALL_ID, teams_call_id
+    )
+    if internal_id is None:
+        raise HTTPException(status_code=404, detail=f"Meeting not found: {teams_call_id}")
+    _meeting_id_cache[teams_call_id] = internal_id
+    return internal_id
+
+
+async def _resolve_participant_id(teams_call_id: str, ext_participant_id: str) -> uuid.UUID:
+    """Resolve an external participant ID to the internal UUID."""
+    cache_key = (teams_call_id, ext_participant_id)
+    if cache_key in _participant_id_cache:
+        return _participant_id_cache[cache_key]
+
+    internal_meeting_id = await _resolve_meeting_id(teams_call_id)
+    internal_id = await db_pool.fetchval(
+        "SELECT id FROM participants WHERE meeting_id = $1 AND aad_user_id = $2",
+        internal_meeting_id,
+        ext_participant_id,
+    )
+    if internal_id is None:
+        # Auto-register with placeholder name
+        internal_id = await db_pool.fetchval(
+            """INSERT INTO participants (meeting_id, aad_user_id, display_name, joined_at)
+               VALUES ($1, $2, $3, NOW())
+               ON CONFLICT (meeting_id, aad_user_id)
+               DO UPDATE SET display_name = EXCLUDED.display_name
+               RETURNING id""",
+            internal_meeting_id,
+            ext_participant_id,
+            "Unknown",
+        )
+    _participant_id_cache[cache_key] = internal_id
+    return internal_id
+
+
 # --- Database operations ---
 
 
-async def store_segment(pool: asyncpg.Pool, meeting_id: str, participant_id: str, segment: dict):
-    """Store a transcript segment in PostgreSQL."""
-    await pool.execute(
+async def store_segment(
+    pool: asyncpg.Pool, meeting_id: uuid.UUID, participant_id: uuid.UUID, segment: dict
+) -> uuid.UUID:
+    """Store a transcript segment in PostgreSQL. Returns the generated segment UUID."""
+    return await pool.fetchval(
         """INSERT INTO transcript_segments
            (meeting_id, participant_id, start_ms, end_ms, original_text, source_language, confidence)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)""",
+           VALUES ($1, $2, $3, $4, $5, $6, $7)
+           RETURNING id""",
         meeting_id,
         participant_id,
         segment["start_ms"],
@@ -99,24 +168,71 @@ async def store_segment(pool: asyncpg.Pool, meeting_id: str, participant_id: str
     )
 
 
-async def request_translation(channel: aio_pika.abc.AbstractChannel, text: str, source_lang: str, segment_id: str):
-    """Publish a translation request to RabbitMQ."""
+async def request_translation(
+    channel: aio_pika.abc.AbstractChannel,
+    text: str,
+    source_lang: str,
+    segment_uuid: uuid.UUID,
+    callback_queue_name: str,
+):
+    """Publish a translation request to RabbitMQ with RPC reply_to."""
     exchange = await channel.declare_exchange(MQ_EXCHANGE, aio_pika.ExchangeType.DIRECT)
 
     lang_3 = LANG_2_TO_3.get(source_lang, source_lang)
     routing_key = f"{MQ_EXCHANGE}.{lang_3}.est.general"
 
-    body = json.dumps({"text": text, "src": lang_3, "tgt": "est", "segment_id": str(segment_id)})
+    body = json.dumps({"text": text, "src": lang_3, "tgt": "est"})
 
     await exchange.publish(
-        aio_pika.Message(body=body.encode(), content_type="application/json"),
+        aio_pika.Message(
+            body=body.encode(),
+            content_type="application/json",
+            reply_to=callback_queue_name,
+            correlation_id=str(segment_uuid),
+        ),
         routing_key=routing_key,
     )
-    logger.info("Translation requested: %s->est for segment %s", lang_3, segment_id)
+    logger.info("Translation requested: %s->est for segment %s", lang_3, segment_uuid)
+
+
+async def _on_translation_response(message: aio_pika.IncomingMessage):
+    """Handle translation response from the NMT worker."""
+    async with message.process():
+        try:
+            data = json.loads(message.body)
+            segment_id_str = message.correlation_id
+            if not segment_id_str:
+                logger.warning("Translation response missing correlation_id, ignoring")
+                return
+
+            segment_uuid = uuid.UUID(segment_id_str)
+
+            if data.get("status_code") != 200:
+                logger.error(
+                    "Translation failed for segment %s: %s",
+                    segment_id_str,
+                    data.get("status"),
+                )
+                return
+
+            translated_text = data.get("result", "")
+            if not translated_text:
+                logger.warning("Empty translation result for segment %s", segment_id_str)
+                return
+
+            if db_pool:
+                await db_pool.execute(
+                    "UPDATE transcript_segments SET translated_text = $1 WHERE id = $2",
+                    translated_text,
+                    segment_uuid,
+                )
+                logger.info("Translation stored for segment %s", segment_id_str)
+        except Exception:
+            logger.exception("Error processing translation response")
 
 
 async def trigger_summarization(
-    pool: asyncpg.Pool, meeting_id: str, chat_messages: list[ChatMessageItem] | None = None
+    pool: asyncpg.Pool, meeting_id: uuid.UUID, chat_messages: list[ChatMessageItem] | None = None
 ):
     """After meeting ends, fetch full transcript + chat messages and request summary from Gemma."""
     rows = await pool.fetch(
@@ -214,7 +330,7 @@ async def _connect_rabbitmq() -> tuple[aio_pika.abc.AbstractRobustConnection | N
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Manage startup and shutdown of database and message queue connections."""
-    global db_pool, mq_connection, mq_channel
+    global db_pool, mq_connection, mq_channel, translation_callback_queue
 
     logger.info("Transcript Assembly Service starting...")
     logger.info("Database: %s", DATABASE_URL.split("@")[1] if "@" in DATABASE_URL else DATABASE_URL)
@@ -223,6 +339,13 @@ async def lifespan(app: FastAPI):
 
     db_pool = await _connect_postgres()
     mq_connection, mq_channel = await _connect_rabbitmq()
+
+    # Set up translation response callback queue
+    if mq_channel:
+        callback_queue = await mq_channel.declare_queue("", exclusive=True)
+        translation_callback_queue = callback_queue.name
+        await callback_queue.consume(_on_translation_response)
+        logger.info("Translation callback queue: %s", translation_callback_queue)
 
     yield
 
@@ -250,21 +373,44 @@ async def health():
 
 @app.post("/meetings")
 async def create_meeting(req: MeetingCreateRequest):
-    """Create a meeting record. Called by ingestion on first audio chunk."""
+    """Create a meeting record. Called by ingestion on first audio chunk.
+
+    The ingestion service sends a Teams call ID string as meeting_id.
+    We store it in teams_call_id and let PostgreSQL generate the UUID PK."""
     if not db_pool:
         raise HTTPException(status_code=503, detail=DB_NOT_AVAILABLE)
 
     try:
-        await db_pool.execute(
-            """INSERT INTO meetings (id, owner_aad_id, title, started_at)
-               VALUES ($1, $2, $3, NOW())
-               ON CONFLICT (id) DO NOTHING""",
+        # Check if meeting already exists
+        row = await db_pool.fetchrow(
+            SQL_MEETING_BY_CALL_ID, req.meeting_id
+        )
+        if row:
+            internal_id = row["id"]
+        else:
+            internal_id = await db_pool.fetchval(
+                """INSERT INTO meetings (teams_call_id, owner_aad_id, title, started_at)
+                   VALUES ($1, $2, $3, NOW())
+                   ON CONFLICT (teams_call_id) DO NOTHING
+                   RETURNING id""",
+                req.meeting_id,
+                req.owner_aad_id,
+                req.meeting_title,
+            )
+            if internal_id is None:
+                # Race condition: concurrent insert won
+                internal_id = await db_pool.fetchval(
+                    SQL_MEETING_BY_CALL_ID, req.meeting_id
+                )
+
+        _meeting_id_cache[req.meeting_id] = internal_id
+        logger.info(
+            "Meeting created: teams_call_id=%s -> uuid=%s (%s)",
             req.meeting_id,
-            req.owner_aad_id,
+            internal_id,
             req.meeting_title,
         )
-        logger.info("Meeting created: %s (%s)", req.meeting_id, req.meeting_title)
-        return {"ok": True, "meeting_id": req.meeting_id}
+        return {"ok": True, "meeting_id": str(internal_id)}
     except Exception:
         logger.exception("Error creating meeting %s", req.meeting_id)
         raise HTTPException(status_code=500, detail="Failed to create meeting")
@@ -272,27 +418,38 @@ async def create_meeting(req: MeetingCreateRequest):
 
 @app.post("/participants")
 async def register_participant(req: ParticipantRequest):
-    """Register or update a participant in a meeting."""
+    """Register or update a participant in a meeting.
+
+    The ingestion service sends an external participant ID (AAD object ID or MSI).
+    We store it in aad_user_id and let PostgreSQL generate the UUID PK."""
     if not db_pool:
         raise HTTPException(status_code=503, detail=DB_NOT_AVAILABLE)
 
     try:
-        await db_pool.execute(
-            """INSERT INTO participants (id, meeting_id, display_name, email)
-               VALUES ($1, $2, $3, $4)
-               ON CONFLICT (id, meeting_id) DO UPDATE SET display_name = $3, email = $4""",
+        internal_meeting_id = await _resolve_meeting_id(req.meeting_id)
+
+        row = await db_pool.fetchrow(
+            """INSERT INTO participants (meeting_id, aad_user_id, display_name, email, joined_at)
+               VALUES ($1, $2, $3, $4, NOW())
+               ON CONFLICT (meeting_id, aad_user_id)
+               DO UPDATE SET display_name = EXCLUDED.display_name, email = EXCLUDED.email
+               RETURNING id""",
+            internal_meeting_id,
             req.participant_id,
-            req.meeting_id,
             req.display_name,
             req.email,
         )
+        internal_participant_id = row["id"]
+        _participant_id_cache[(req.meeting_id, req.participant_id)] = internal_participant_id
+
         logger.info(
-            "Participant registered: %s (%s) in meeting %s",
+            "Participant registered: ext_id=%s -> uuid=%s (%s) in meeting %s",
             req.participant_id,
+            internal_participant_id,
             req.display_name,
             req.meeting_id,
         )
-        return {"ok": True}
+        return {"ok": True, "participant_id": str(internal_participant_id)}
     except Exception:
         logger.exception("Error registering participant %s", req.participant_id)
         raise HTTPException(status_code=500, detail="Failed to register participant")
@@ -305,6 +462,9 @@ async def receive_segment(req: SegmentRequest):
         raise HTTPException(status_code=503, detail=DB_NOT_AVAILABLE)
 
     try:
+        internal_meeting_id = await _resolve_meeting_id(req.meeting_id)
+        internal_participant_id = await _resolve_participant_id(req.meeting_id, req.participant_id)
+
         segment = {
             "start_ms": req.start_ms,
             "end_ms": req.end_ms,
@@ -312,7 +472,7 @@ async def receive_segment(req: SegmentRequest):
             "language": req.language,
             "confidence": req.confidence,
         }
-        await store_segment(db_pool, req.meeting_id, req.participant_id, segment)
+        segment_uuid = await store_segment(db_pool, internal_meeting_id, internal_participant_id, segment)
         logger.debug(
             "Segment stored: meeting=%s participant=%s [%d-%d] %s",
             req.meeting_id,
@@ -323,9 +483,11 @@ async def receive_segment(req: SegmentRequest):
         )
 
         # Request translation if the language qualifies
-        if req.language in TRANSLATE_LANGUAGES and mq_channel:
+        if req.language in TRANSLATE_LANGUAGES and mq_channel and translation_callback_queue:
             try:
-                await request_translation(mq_channel, req.text, req.language, f"{req.meeting_id}_{req.start_ms}")
+                await request_translation(
+                    mq_channel, req.text, req.language, segment_uuid, translation_callback_queue
+                )
             except Exception:
                 logger.exception("Error requesting translation for segment")
 
@@ -344,14 +506,18 @@ async def end_meeting(req: EndMeetingRequest):
     logger.info("End-meeting signal received for %s", req.meeting_id)
 
     try:
+        internal_meeting_id = await _resolve_meeting_id(req.meeting_id)
+
         # Update meeting record
         await db_pool.execute(
-            """UPDATE meetings SET ended_at = NOW() WHERE id = $1""",
-            req.meeting_id,
+            "UPDATE meetings SET ended_at = NOW(), status = 'ended' WHERE id = $1",
+            internal_meeting_id,
         )
 
         # Trigger summarization in background to avoid blocking the response
-        asyncio.create_task(_run_summarization(req.meeting_id, req.chat_messages))
+        task = asyncio.create_task(_run_summarization(internal_meeting_id, req.chat_messages))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
         return {"ok": True, "message": f"Summarization triggered for meeting {req.meeting_id}"}
     except Exception:
@@ -359,7 +525,7 @@ async def end_meeting(req: EndMeetingRequest):
         raise HTTPException(status_code=500, detail="Failed to process end-meeting")
 
 
-async def _run_summarization(meeting_id: str, chat_messages: list[ChatMessageItem] | None = None):
+async def _run_summarization(meeting_id: uuid.UUID, chat_messages: list[ChatMessageItem] | None = None):
     """Run summarization in the background."""
     try:
         await trigger_summarization(db_pool, meeting_id, chat_messages)
@@ -375,9 +541,13 @@ class SummarizeNowRequest(BaseModel):
 @app.post("/summarize-now")
 async def summarize_now(req: SummarizeNowRequest):
     """On-demand summary for the bot to post mid-meeting or at meeting end.
-    Returns the summary text synchronously (blocks until Gemma responds)."""
+    Returns the summary text synchronously (blocks until LLM responds).
+
+    meeting_id can be either a Teams call ID string or internal UUID."""
     if not db_pool:
         raise HTTPException(status_code=503, detail=DB_NOT_AVAILABLE)
+
+    internal_meeting_id = await _resolve_meeting_id(req.meeting_id)
 
     rows = await db_pool.fetch(
         """SELECT ts.start_ms, ts.original_text, ts.source_language,
@@ -386,7 +556,7 @@ async def summarize_now(req: SummarizeNowRequest):
            JOIN participants p ON ts.participant_id = p.id
            WHERE ts.meeting_id = $1
            ORDER BY ts.start_ms""",
-        req.meeting_id,
+        internal_meeting_id,
     )
 
     if not rows:

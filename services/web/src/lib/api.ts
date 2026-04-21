@@ -66,7 +66,10 @@ export async function getTranscript(
   return apiFetch<Transcript>(`/transcripts/${id}`, token);
 }
 
-export function getWebSocketUrl(): string {
+export function getLiveWebSocketUrl(
+  meetingId: string,
+  token: string
+): string {
   const wsBase = API_URL.replace(/^http/, "ws");
-  return `${wsBase}/ws/transcribe`;
+  return `${wsBase}/ws/meetings/${meetingId}/live?token=${encodeURIComponent(token)}`;
 }

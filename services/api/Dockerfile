@@ -2,9 +2,10 @@ FROM python:3.13-slim
 
 WORKDIR /app
 
-RUN apt-get update && \
-    apt-get install --yes --no-install-recommends curl ffmpeg && \
-    rm -rf /var/cache/apt/archives /var/lib/apt/lists/*
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && \
+    apt-get install --yes --no-install-recommends curl ffmpeg
 
 RUN pip install --no-cache-dir fastapi uvicorn httpx websockets python-multipart aiofiles asyncpg PyJWT[crypto]
 

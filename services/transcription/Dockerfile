@@ -3,14 +3,15 @@ FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu24.04
 WORKDIR /app
 
 # Install Python + system deps
-RUN apt-get update && \
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && \
     apt-get install --yes --no-install-recommends \
         software-properties-common curl pciutils && \
     add-apt-repository ppa:deadsnakes/ppa && \
     apt-get update && \
     apt-get install --yes --no-install-recommends \
-        python3.13-dev python3.13-venv && \
-    rm -rf /var/cache/apt/archives /var/lib/apt/lists/*
+        python3.13-dev python3.13-venv
 
 # Create venv and install WhisperLiveKit with GPU + diarization
 RUN python3.13 -m venv /app/venv

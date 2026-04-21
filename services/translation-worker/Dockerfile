@@ -1,8 +1,9 @@
 FROM python:3.10-slim
 
-RUN apt-get update && \
-    apt-get install --yes --no-install-recommends gcc g++ libffi-dev git && \
-    rm -rf /var/cache/apt/archives /var/lib/apt/lists/*
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && \
+    apt-get install --yes --no-install-recommends gcc g++ libffi-dev git
 
 ENV PYTHONIOENCODING=utf-8
 ENV MKL_NUM_THREADS=4

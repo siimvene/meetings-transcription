@@ -152,10 +152,8 @@ class AudioSession:
         """Close the WebSocket connection and cancel the receive task."""
         if self._receive_task and not self._receive_task.done():
             self._receive_task.cancel()
-            try:
-                await self._receive_task
-            except asyncio.CancelledError:
-                pass
+            # Wait for the task we just cancelled — suppress only that expected CancelledError
+            await asyncio.gather(self._receive_task, return_exceptions=True)
 
         if self.ws and not self.ws.closed:
             try:
