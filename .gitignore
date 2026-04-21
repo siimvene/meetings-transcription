@@ -9,3 +9,10 @@ data/
 *.webm
 .DS_Store
 .omc/
+
+# Bob the Fixer local configuration
+bobthefixer.env
+# SonarQube local configuration
+sonar-project.properties
+.scannerwork/
+tsconfig.tsbuildinfo
